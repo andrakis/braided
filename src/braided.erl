@@ -32,10 +32,25 @@
 	{done, OutValue::term()}  | {donestate, OutValue::term(), OutState::term()} |
 	{fail, OutValue::term()}  | {failstate, OutValue::term(), OutState::term()}.
 
+-record(braided_out, {
+	ref          :: reference(),
+	out          :: term()
+}).
+
+-type async_callback() :: fun((OutValue::term()) -> _).
+
 -type callback() ::
 	% Synchronous methods
 	fun((Value::term()) -> backresult()) |
-	fun((Value::term(), InState::term()) -> backresult()).
+	fun((Value::term(), InState::term()) -> backresult()) |
+	% Note: Asynchronous methods cannot update the state, though can receive state.
+	%       The behaviour of sending a new state is undefined.
+	% Asynchronous methods - update and send the record to the given pid.
+	{async_notify, fun((Value::term(), Pid::pid(), AsyncOut::#braided_out{}) -> _)} |
+	{async_notify, fun((Value::term(), InState::term(), Pid::pid(), AsyncOut::#braided_out{}) -> _)} |
+	% Asynchronous methods - call the result callback with result
+	{async_callback, fun((Value::term(), ResultCallback::async_callback()) -> _)} |
+	{async_callback, fun((Value::term(), InState::term(), ResultCallback::async_callback()) -> _)}.
 
 
 -type errback() :: undefined | callback().
@@ -43,6 +58,12 @@
 -type final() ::
 	fun((AllValues::term()) -> _) |
 	fun((AllValues::term(), FinalState::term()) -> _).
+
+-type async_parallel() ::
+	% Detect based on SMP configuration: one per enabled scheduler
+	smp_detect |
+	% Force a given parallel value
+	pos_integer().
 
 -record(braid, {
 	state,
@@ -52,7 +73,12 @@
 	done         :: final(),
 	fail         :: final(),
 	results = [] :: [term()],
-	async = false:: boolean()
+	async = false:: boolean(),
+	parallel = false :: boolean(),
+	parallel_limit = smp_detect :: async_parallel(),
+	% How many parallel tasks are running right now
+	parallel_tasks = 0 :: integer(),
+	ref          :: reference()
 }).
 
 %% @doc Start the braid operation. Does some initial setup, then passed on to i_loop/1.
@@ -64,8 +90,23 @@ go(#braid{ async = true } = B0) ->
 	end),
 	ok;
 go(#braid{} = B0) ->
-	i_loop(B0).
+	case init(B0) of
+		{ok, B1} -> i_loop(B1)
+	end.
 
+%% @doc Create the initial state for the braid.
+-spec init(#braid{}) -> {ok, #braid{}}.
+init(#braid{ parallel = true, parallel_limit = smp_detect } = B0) ->
+	SchedulerCount = erlang:system_info(schedulers),
+	B1 = B0#braid{ parallel_limit = SchedulerCount },
+	init(B1);
+init(B0) ->
+	B1 = B0#braid{ ref = make_ref() },
+	{ok, B1}.
+
+%% @doc Main loop for a braided operation. Gets the next value from the generator, and
+%%      passes it to the callback. If the generator is empty, moves to done state.
+%% @private
 i_loop(#braid{ generator = [H | T]} = B0) ->
 	B1 = B0#braid{ generator = T },
 	go_callback(H, B1);
@@ -88,6 +129,19 @@ go_callback({valstate, OutVal, OutState}, B0) ->
 	go_callback(OutVal, B1);
 go_callback(DoneOrFail, B0) when DoneOrFail == done; DoneOrFail == fail ->
 	handle_state(DoneOrFail, B0);
+go_callback(In, #braid{ parallel = true, parallel_tasks = Tasks, parallel_limit = Limit } = B0)
+		when Tasks < Limit ->
+	?debugFmt("[~p] Not at task limit [~p], spawning next~n",
+		[Tasks, Limit]),
+	B1 = B0#braid{
+		parallel_tasks = Tasks + 1
+	},
+	start_async(In, B1),
+	i_loop(B1);
+go_callback(In, #braid{ parallel = true } = B0) ->
+	% No space!
+	wait_callback(B0),
+	go_callback(In, B0);
 go_callback(In, #braid{ callback = Callback } = B0) ->
 	try
 		Val0 = if
@@ -141,6 +195,45 @@ handle_back({skipstate, OutState}, B0) ->
 handle_back(Out, B0) ->
 	handle_back({value, Out}, B0).
 
+start_async(In, #braid{ callback = {async_notify, Fun} } = B0) ->
+	Out = #braided_out{ ref = B0#braid.ref },
+	Self = self(),
+	if
+		is_function(Fun, 3) ->
+			spawn(fun() -> Fun(In, Self, Out) end);
+		is_function(Fun, 4) ->
+			spawn(fun() -> Fun(In, B0#braid.state, Self, Out) end)
+	end,
+	ok;
+start_async(In, #braid{ callback = {async_callback, Fun} } = B0) ->
+	Self = self(),
+	Callback = fun(Out) ->
+		Self ! #braided_out{ ref = B0#braid.ref, out = Out }
+	end,
+	if
+		is_function(Fun, 2) ->
+			spawn(fun() -> Fun(In, Callback) end);
+		is_function(Fun, 3) ->
+			spawn(fun() -> Fun(In, B0#braid.state, Callback) end)
+	end,
+	ok.
+
+%% @doc Wait for a callback result if currently at task limit, or no tasks remain.
+%%      If not at task limit, and tasks remain, return to i_loop/1 to start more tasks.
+wait_callback(#braid{ parallel_tasks = Tasks, parallel_limit = Limit } = B0)
+		when Tasks > 0, Tasks >= Limit ->
+	Ref = B0#braid.ref,
+	receive
+		#braided_out{ ref = Ref, out = Out } ->
+			B1 = B0#braid{
+				results = [Out | B0#braid.results],
+				parallel_tasks = B0#braid.parallel_tasks - 1
+			},
+			wait_callback(B1)
+	end;
+wait_callback(B0) ->
+	i_loop(B0).
+
 %% @doc Handle a state update - in the case of the various value and error states, move onto
 %%      the next generator item and continue.
 %%      In the case of done or fail, call the respective handler with the results and state.
@@ -152,11 +245,19 @@ handle_state(State, B0)
 	i_loop(B0);
 handle_state(DoneOrDoneState, #braid{ done = Done } = B0)
 		when DoneOrDoneState == done; DoneOrDoneState == donestate ->
-	Results = lists:reverse(B0#braid.results),
 	if
-		is_function(Done, 1) -> Done(Results);
-		is_function(Done, 2) -> Done(Results, B0#braid.state);
-		true -> nop
+		B0#braid.parallel_tasks > 0 ->
+			% This will cause wait_callback to wait for all results, and when finally
+			% done, call handle_state again.
+			B1 = B0#braid{ parallel_limit = 0, generator = [] },
+			wait_callback(B1);
+		true ->
+			Results = lists:reverse(B0#braid.results),
+			if
+				is_function(Done, 1) -> Done(Results);
+				is_function(Done, 2) -> Done(Results, B0#braid.state);
+				true -> nop
+			end
 	end;
 handle_state(FailOrFailState, #braid{ fail = Fail } = B0)
 		when FailOrFailState == fail; FailOrFailState == failstate ->
