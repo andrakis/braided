@@ -22,6 +22,8 @@
 
 -record(braided_out, {
 	ref          :: reference(),
+	% Used for sorting parallel results when finishing
+	order        :: integer(),
 	out          :: term()
 }).
 
@@ -65,6 +67,8 @@
 	parallel_limit = smp_detect :: async_parallel(),
 	% How many parallel tasks are running right now
 	parallel_tasks = 0          :: integer(),
+	% Keeps track of parallel sort order index
+	parallel_sort_index = 0     :: integer(),
 	ref                         :: reference()
 }).
 

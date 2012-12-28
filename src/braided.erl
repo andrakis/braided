@@ -73,8 +73,8 @@ go_callback(In, #braid{ parallel = true, parallel_tasks = Tasks, parallel_limit 
 	B1 = B0#braid{
 		parallel_tasks = Tasks + 1
 	},
-	start_async(In, B1),
-	i_loop(B1);
+	B2 = start_async(In, B1),
+	i_loop(B2);
 go_callback(In, #braid{ parallel = true } = B0) ->
 	?debugFmt("(~p) At task limit, waiting~n", [self()]),
 	% No space!
@@ -137,30 +137,32 @@ handle_back(Out, B0) ->
 %% @doc Start an async callback. Supports async_notify and async_callback.
 %%      The receiver for all results is wait_callback/1.
 %% @private
--spec start_async(In::term(), #braid{}) -> ok.
-start_async(In, #braid{ callback = {async_notify, Fun} } = B0) ->
-	Out = #braided_out{ ref = B0#braid.ref },
+-spec start_async(In::term(), #braid{}) -> #braid{}.
+start_async(In, #braid{ callback = {async_notify, Fun}, parallel_sort_index = SortIndex } = B0) ->
+	B1 = B0#braid{ parallel_sort_index  = SortIndex + 1 },
+	Out = #braided_out{ ref = B0#braid.ref, order = SortIndex },
 	Self = self(),
 	if
 		is_function(Fun, 3) ->
 			spawn(fun() -> Fun(In, Self, Out) end);
 		is_function(Fun, 4) ->
-			spawn(fun() -> Fun(In, B0#braid.state, Self, Out) end)
+			spawn(fun() -> Fun(In, B1#braid.state, Self, Out) end)
 	end,
-	ok;
-start_async(In, #braid{ callback = {async_callback, Fun} } = B0) ->
+	B1;
+start_async(In, #braid{ callback = {async_callback, Fun}, parallel_sort_index = SortIndex } = B0) ->
+	B1 = B0#braid{ parallel_sort_index  = SortIndex + 1 },
 	Self = self(),
 	Callback = fun(Out) ->
 		?debugFmt("(~p) Callback called with ~p~n", [Self, Out]),
-		Self ! #braided_out{ ref = B0#braid.ref, out = Out }
+		Self ! #braided_out{ ref = B1#braid.ref, order = SortIndex, out = Out }
 	end,
 	if
 		is_function(Fun, 2) ->
 			spawn(fun() -> Fun(In, Callback) end);
 		is_function(Fun, 3) ->
-			spawn(fun() -> Fun(In, B0#braid.state, Callback) end)
+			spawn(fun() -> Fun(In, B1#braid.state, Callback) end)
 	end,
-	ok.
+	B1.
 
 %% @doc Wait for a callback result if currently at task limit, or no tasks remain.
 %%      If not at task limit, and tasks remain, return to i_loop/1 to start more tasks.
@@ -169,7 +171,7 @@ wait_callback(#braid{ parallel_tasks = Tasks, parallel_limit = Limit } = B0)
 		when Tasks > 0, Tasks >= Limit ->
 	Ref = B0#braid.ref,
 	receive
-		#braided_out{ ref = Ref, out = Out } ->
+		#braided_out{ ref = Ref } = Out ->
 			B1 = B0#braid{
 				results = [Out | B0#braid.results],
 				parallel_tasks = B0#braid.parallel_tasks - 1
@@ -200,7 +202,7 @@ handle_state(DoneOrDoneState, #braid{ done = Done } = B0)
 			handle_state(DoneOrDoneState, B2);
 		true ->
 			?debugFmt("(~p) All done, calling callback~n", [self()]),
-			Results = lists:reverse(B0#braid.results),
+			Results = get_results(B0),
 			if
 				is_function(Done, 1) -> Done(Results);
 				is_function(Done, 2) -> Done(Results, B0#braid.state);
@@ -215,6 +217,17 @@ handle_state(FailOrFailState, #braid{ fail = Fail } = B0)
 		is_function(Fail, 2) -> Fail(Results, B0#braid.state);
 		true -> nop
 	end.
+
+%% @doc Get the results for the completed braid operation.
+%%      Non-parallel only requires reversing of results.
+%%      Paralell requires sorting by order.
+%% @private
+-spec get_results(#braid{}) -> [term()].
+get_results(#braid{ parallel = false, results = Results }) ->
+	lists:reverse(Results);
+get_results(#braid{ parallel = true, results = Results }) ->
+	Sorted = lists:keysort(#braided_out.order, Results),
+	[ Out#braided_out.out || Out <- Sorted ].
 
 -ifdef(TEST).
 
@@ -299,12 +312,19 @@ go_generator_callback_test() ->
 
 	ok.
 
+% Maximum wait time in ms
+-define(waitMax, 500).
+-define(waitRandom, (fun() ->
+	timer:sleep(random:uniform(?waitMax))
+end)).
+
 go_parallel_callback_test() ->
 	?debugFmt("MARK~n", []),
 	B0 = #braid{
 		generator = [1, 2, 3, 4],
 		callback = {async_callback, fun(Value, Callback) ->
 			?debugFmt("Callback with ~p~n", [Value]),
+			?waitRandom(),
 			Callback(integer_to_list(Value))
 		end},
 		parallel = true
@@ -318,6 +338,7 @@ go_parallel_callback_test() ->
 		state = State,
 		callback = {async_callback, fun(Value, InState, Callback) ->
 			?assertEqual(State, InState),
+			?waitRandom(),
 			Callback(integer_to_list(Value))
 		end}
 	},
@@ -332,6 +353,7 @@ go_parallel_notify_test() ->
 		generator = [1, 2, 3, 4],
 		callback = {async_notify, fun(Value, Pid, Out0) ->
 			?debugFmt("Notify with ~p~n", [Value]),
+			?waitRandom(),
 			Out1 = Out0#braided_out{ out = integer_to_list(Value) },
 			Pid ! Out1
 		end},
@@ -346,12 +368,35 @@ go_parallel_notify_test() ->
 		state = State,
 		callback = {async_notify, fun(Value, InState, Pid, Out0) ->
 			?assertEqual(State, InState),
+			?waitRandom(),
 			Out1 = Out0#braided_out{ out = integer_to_list(Value) },
 			Pid ! Out1
 		end}
 	},
 
 	?assertEqual(["1", "2", "3", "4"], go(B1)),
+
+	ok.
+
+get_results_test() ->
+	B0 = #braid{
+		parallel = false,
+		results = [4, 3, 2, 1]
+	},
+
+	?assertEqual([1, 2, 3, 4], get_results(B0)),
+
+	B1 = #braid{
+		parallel = true,
+		results = [
+			#braided_out{ order = 1, out = b },
+			#braided_out{ order = 0, out = a },
+			#braided_out{ order = 3, out = d },
+			#braided_out{ order = 2, out = c }
+		]
+	},
+
+	?assertEqual([a, b, c, d], get_results(B1)),
 
 	ok.
 -endif.
